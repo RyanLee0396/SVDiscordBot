@@ -5,8 +5,14 @@ import sqlite3
 import pytz
 from datetime import datetime, timedelta
 import os
+from database import DatabaseManager, init_db
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DB_PATH = "scrim_bot.db"
+
+# Initialize database
+db = DatabaseManager(DB_PATH)
 
 # --- Database Setup ---
 conn = sqlite3.connect("scrim_bot.db")
@@ -50,40 +56,59 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents, application_id="1372785675107045447")
 
 # --- Helper Functions ---
-def get_scrim_times():
-    cursor.execute("SELECT time_period FROM scrims")
-    return [row[0] for row in cursor.fetchall()]
-
-def add_scrim_time(time_period):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def safe_discord_operation(operation, *args, **kwargs):
+    """Safely execute Discord operations with retry logic"""
     try:
-        cursor.execute("INSERT INTO scrims (time_period) VALUES (?)", (time_period,))
-        conn.commit()
+        return await operation(*args, **kwargs)
+    except discord.HTTPException as e:
+        if e.status == 429:  # Rate limit
+            raise  # Let retry handle it
+        raise
+
+async def get_scrim_times():
+    return await db.fetch_all("SELECT time_period FROM scrims")
+
+async def add_scrim_time(time_period):
+    try:
+        async with db.transaction() as cursor:
+            await cursor.execute("INSERT INTO scrims (time_period) VALUES (?)", (time_period,))
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
         return False
 
-def add_team(team_name, scrim_time, leader_id):
-    cursor.execute("INSERT INTO teams (team_name, scrim_time, leader_id) VALUES (?, ?, ?)",
-                   (team_name, scrim_time, leader_id))
-    conn.commit()
-    return cursor.lastrowid
+async def add_team(team_name, scrim_time, leader_id):
+    async with db.transaction() as cursor:
+        await cursor.execute(
+            "INSERT INTO teams (team_name, scrim_time, leader_id) VALUES (?, ?, ?)",
+            (team_name, scrim_time, leader_id)
+        )
+        return cursor.lastrowid
 
-def get_teams(scrim_time):
-    cursor.execute("SELECT team_name FROM teams WHERE scrim_time = ?", (scrim_time,))
-    return [row[0] for row in cursor.fetchall()]
+async def get_teams(scrim_time):
+    results = await db.fetch_all("SELECT team_name FROM teams WHERE scrim_time = ?", (scrim_time,))
+    return [row['team_name'] for row in results]
 
-def add_team_member(team_id, member_name):
-    cursor.execute("INSERT INTO members (team_id, member_name) VALUES (?, ?)", (team_id, member_name))
-    conn.commit()
+async def add_team_member(team_id, member_name):
+    async with db.transaction() as cursor:
+        # Check if team exists and has space
+        await cursor.execute("SELECT COUNT(*) as count FROM members WHERE team_id = ?", (team_id,))
+        result = await cursor.fetchone()
+        if result['count'] < 5:  # Assuming max 5 members per team
+            await cursor.execute(
+                "INSERT INTO members (team_id, member_name) VALUES (?, ?)",
+                (team_id, member_name)
+            )
+            return True
+        return False
 
-def get_team_members(team_id):
-    cursor.execute("SELECT member_name FROM members WHERE team_id = ?", (team_id,))
-    return [row[0] for row in cursor.fetchall()]
+async def get_team_members(team_id):
+    results = await db.fetch_all("SELECT member_name FROM members WHERE team_id = ?", (team_id,))
+    return [row['member_name'] for row in results]
 
-def get_team_id(team_name):
-    cursor.execute("SELECT id FROM teams WHERE team_name = ?", (team_name,))
-    result = cursor.fetchone()
-    return result[0] if result else None
+async def get_team_id(team_name):
+    result = await db.fetch_one("SELECT id FROM teams WHERE team_name = ?", (team_name,))
+    return result['id'] if result else None
 
 # Define the get_current_week_period function
 
@@ -136,6 +161,7 @@ def create_schedule_embed(team_name, scrim_times):
 # --- Sync Commands ---
 @bot.event
 async def on_ready():
+    await init_db(DB_PATH)
     await bot.tree.sync()
     print(f"Bot is logged in as {bot.user}")
 
@@ -177,9 +203,7 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data.get("custom_id")
 
-        if custom_id == "add_scrim":
-            await add_scrim_logic(interaction)
-        elif custom_id == "list_teams":
+        if custom_id == "list_teams":
             scrim_time = "21:00"  # Replace with the desired scrim time
             await list_teams_logic(interaction, scrim_time)
         elif custom_id == "reset_database":
@@ -418,52 +442,94 @@ async def quit_team_logic(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def scrim_signup_logic(interaction: discord.Interaction):
-    """Logic to sign up for scrims for the week"""
+    """Logic to sign up for scrims for the week with proper concurrency handling"""
     korean_tz = pytz.timezone('Asia/Seoul')
     start_date = datetime.now(korean_tz)
     days_of_week = [(start_date + timedelta(days=i)).strftime('%d/%m') for i in range(7)]
-    available_days = []
+    
     leader_id = interaction.user.id
-    cursor.execute("SELECT team_name FROM teams WHERE leader_id = ?", (leader_id,))
-    team = cursor.fetchone()
-    if team:
-        team_name = team[0]
-        cursor.execute("SELECT scrim_time FROM teams WHERE team_name = ?", (team_name,))
-        signed_up_days = [row[0] for row in cursor.fetchall()]
-        for day in days_of_week:
-            if day not in signed_up_days and len(get_teams(day)) < 12:
-                available_days.append(day)
+    team = await db.fetch_one("SELECT team_name FROM teams WHERE leader_id = ?", (leader_id,))
+    
+    if not team:
+        embed = create_info_embed("Error", "You are not a leader of any team.", discord.Color.red())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    team_name = team['team_name']
+    signed_up_days = await db.fetch_all(
+        "SELECT scrim_time FROM teams WHERE team_name = ?",
+        (team_name,)
+    )
+    signed_up_days = [row['scrim_time'] for row in signed_up_days]
+
+    available_days = []
+    for day in days_of_week:
+        if day not in signed_up_days:
+            # Check team count with proper locking
+            async with db.transaction() as cursor:
+                await cursor.execute(
+                    "SELECT COUNT(*) as count FROM teams WHERE scrim_time = ?",
+                    (day,)
+                )
+                result = await cursor.fetchone()
+                if result['count'] < 12:
+                    available_days.append(day)
+
+    if not available_days:
+        embed = create_info_embed(
+            "No Available Slots",
+            "There are no available scrim slots for your team.",
+            discord.Color.orange()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     options = [discord.SelectOption(label=day) for day in available_days]
-    select = Select(placeholder="Select scrim days", options=options, min_values=1, max_values=len(available_days))
+    select = Select(
+        placeholder="Select scrim days",
+        options=options,
+        min_values=1,
+        max_values=len(available_days)
+    )
 
     async def select_callback(interaction):
         selected_days = select.values
         scrim_time = "9:00 PM KST"
-        messages = []
-        leader_id = interaction.user.id
-        cursor.execute("SELECT team_name FROM teams WHERE leader_id = ?", (leader_id,))
-        team = cursor.fetchone()
-        if team:
-            team_name = team[0]
-            embed = discord.Embed(
-                title="📅 Scrim Signup Results",
-                color=discord.Color.blue(),
-                timestamp=datetime.now()
-            )
-            for day in selected_days:
-                if len(get_teams(day)) < 12:
-                    cursor.execute("INSERT INTO teams (team_name, scrim_time, leader_id) VALUES (?, ?, ?)", (team_name, day, leader_id))
-                    conn.commit()
-                    embed.add_field(name="✅ Success", value=f"Team signed up for scrim on {day} at {scrim_time}", inline=False)
+        embed = discord.Embed(
+            title="📅 Scrim Signup Results",
+            color=discord.Color.blue(),
+            timestamp=datetime.now()
+        )
+
+        for day in selected_days:
+            async with db.transaction() as cursor:
+                # Double-check availability with proper locking
+                await cursor.execute(
+                    "SELECT COUNT(*) as count FROM teams WHERE scrim_time = ?",
+                    (day,)
+                )
+                result = await cursor.fetchone()
+                if result['count'] < 12:
+                    await cursor.execute(
+                        "INSERT INTO teams (team_name, scrim_time, leader_id) VALUES (?, ?, ?)",
+                        (team_name, day, leader_id)
+                    )
+                    embed.add_field(
+                        name="✅ Success",
+                        value=f"Team signed up for scrim on {day} at {scrim_time}",
+                        inline=False
+                    )
                 else:
-                    embed.add_field(name="❌ Failed", value=f"The scrim on '{day}' is full. Please select another day.", inline=False)
-            embed.set_footer(text="SV Bot | Scrim Signup")
-            view = View()
-            view.add_item(Button(label="Back to Menu", style=discord.ButtonStyle.secondary, custom_id="back_to_menu"))
-            await interaction.response.edit_message(embed=embed, view=view)
-        else:
-            embed = create_info_embed("Error", "You are not a leader of any team.", discord.Color.red())
-            await interaction.response.edit_message(embed=embed, view=None)
+                    embed.add_field(
+                        name="❌ Failed",
+                        value=f"The scrim on '{day}' is full. Please select another day.",
+                        inline=False
+                    )
+
+        embed.set_footer(text="SV Bot | Scrim Signup")
+        view = View()
+        view.add_item(Button(label="Back to Menu", style=discord.ButtonStyle.secondary, custom_id="back_to_menu"))
+        await interaction.response.edit_message(embed=embed, view=view)
 
     select.callback = select_callback
     view = View()
